@@ -1,11 +1,19 @@
 // YT247Desktop - Minimal Win32 GUI app to stream a local video to YouTube Live via ffmpeg
 
+// Networking must include Winsock2 before windows.h
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <commdlg.h>
+#include <winhttp.h>
+#include <wincrypt.h>
+#include <bcrypt.h>
+#include <shlobj.h>
 #include <string>
 #include <vector>
 #include <sstream>
 #include <algorithm>
+#include <cstdint>
 
 // Control IDs
 enum : int {
@@ -19,6 +27,9 @@ enum : int {
     ID_LBL_ARG_HDR = 1019,
     ID_EDIT_ARGS   = 1020,
     ID_BTN_COPYARGS = 1021,
+    ID_BTN_GOOGLE   = 1022,
+    ID_BTN_SIGNOUT  = 1023,
+    ID_LBL_EMAIL    = 1024,
     ID_INFO_HEADER = 1010,
     ID_INFO_L_SIZE = 1011,
     ID_INFO_V_SIZE = 1012,
@@ -28,6 +39,8 @@ enum : int {
     ID_INFO_V_BR   = 1016,
     ID_INFO_L_RES  = 1017,
     ID_INFO_V_RES  = 1018,
+    ID_INFO_L_ORI  = 1025,
+    ID_INFO_V_ORI  = 1026,
     ID_LBL_STATUS = 1006,
     ID_EDIT_LOG   = 1007,
     ID_TIMER_PROC = 2001
@@ -50,6 +63,7 @@ static HWND g_hInfoLSize = nullptr;  static HWND g_hInfoVSize = nullptr;
 static HWND g_hInfoLDur = nullptr;   static HWND g_hInfoVDur = nullptr;
 static HWND g_hInfoLBr = nullptr;    static HWND g_hInfoVBr = nullptr;
 static HWND g_hInfoLRes = nullptr;   static HWND g_hInfoVRes = nullptr;
+static HWND g_hInfoLOr = nullptr;    static HWND g_hInfoVOr = nullptr;
 
 static bool  g_isValidFile = false;
 static bool  g_isStreaming = false;
@@ -64,6 +78,9 @@ static HWND   g_hMainWnd   = nullptr;
 static HWND   g_hLblArgHdr = nullptr;
 static HWND   g_hEditArgs  = nullptr;
 static HWND   g_hBtnCopyArgs = nullptr;
+static HWND   g_hBtnGoogle = nullptr;
+static HWND   g_hBtnSignOut = nullptr;
+static HWND   g_hLblEmail = nullptr;
 
 // Scrolling
 static int    g_scrollPos = 0;       // current vertical scroll position in pixels
@@ -71,6 +88,25 @@ static int    g_contentHeight = 0;   // total content height in pixels
 
 // Custom message to append log text (lParam = wchar_t* allocated on heap)
 constexpr UINT WM_APP_APPEND_LOG = WM_APP + 1;
+// Timer for auth auto-refresh
+constexpr UINT ID_TIMER_AUTH = 2002;
+// Forward decl for early use
+static void AppendLog(const std::wstring& text);
+
+// Firebase/Google OAuth configuration (loaded from env at runtime)
+// Set env vars before running:
+//   YT247_FIREBASE_API_KEY, YT247_GOOGLE_CLIENT_ID, YT247_GOOGLE_CLIENT_SECRET (optional)
+static std::wstring gFirebaseApiKey;     // from env YT247_FIREBASE_API_KEY
+static std::wstring gGoogleClientId;     // from env YT247_GOOGLE_CLIENT_ID
+static std::wstring gGoogleClientSecret; // from env YT247_GOOGLE_CLIENT_SECRET (optional)
+static const wchar_t* kRedirectPath   = L"/callback";
+
+// Auth state
+static bool g_isSignedIn = false;
+static std::wstring g_idToken;
+static std::wstring g_refreshToken;
+static std::wstring g_signedInEmail;
+static std::wstring g_baseTitle;
 
 // Utility: get directory containing current executable
 static std::wstring GetExeDir() {
@@ -108,6 +144,453 @@ static bool FileExists(const std::wstring& p) {
 static std::wstring ToLower(std::wstring s) {
     for (auto &ch : s) ch = (wchar_t)towlower(ch);
     return s;
+}
+
+// URL-encode ASCII string
+static std::string UrlEncode(const std::string& s) {
+    std::ostringstream o;
+    const char* hex = "0123456789ABCDEF";
+    for (unsigned char c : s) {
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c=='-' || c=='_' || c=='.' || c=='~') {
+            o << (char)c;
+        } else {
+            o << '%' << hex[(c>>4)&0xF] << hex[c&0xF];
+        }
+    }
+    return o.str();
+}
+
+static int HexVal(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    return -1;
+}
+
+static std::string UrlDecode(const std::string& s) {
+    std::string o; o.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {
+        char c = s[i];
+        if (c == '%') {
+            if (i + 2 < s.size()) {
+                int h1 = HexVal(s[i+1]);
+                int h2 = HexVal(s[i+2]);
+                if (h1 >= 0 && h2 >= 0) {
+                    o.push_back((char)((h1 << 4) | h2));
+                    i += 2; continue;
+                }
+            }
+            // malformed, keep as-is
+            o.push_back('%');
+        } else if (c == '+') {
+            o.push_back(' ');
+        } else {
+            o.push_back(c);
+        }
+    }
+    return o;
+}
+
+static bool Base64ToBase64Url(std::string& b64) {
+    for (char& c : b64) {
+        if (c == '+') c = '-';
+        else if (c == '/') c = '_';
+    }
+    while (!b64.empty() && b64.back() == '=') b64.pop_back();
+    return true;
+}
+
+static bool Base64UrlEncode(const std::vector<uint8_t>& data, std::string& out) {
+    if (data.empty()) { out.clear(); return true; }
+    DWORD needed = 0;
+    if (!CryptBinaryToStringA(data.data(), (DWORD)data.size(), CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, nullptr, &needed)) return false;
+    std::string b64; b64.resize(needed);
+    if (!CryptBinaryToStringA(data.data(), (DWORD)data.size(), CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, &b64[0], &needed)) return false;
+    if (needed > 0 && b64.back() == '\0') b64.pop_back();
+    Base64ToBase64Url(b64);
+    out = b64; return true;
+}
+
+static bool Sha256(const std::string& in, std::vector<uint8_t>& out32) {
+    BCRYPT_ALG_HANDLE hAlg = nullptr; BCRYPT_HASH_HANDLE hHash = nullptr;
+    DWORD cbHash = 32, cbData = 0; out32.assign(32, 0);
+    if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) < 0) return false;
+    if (BCryptCreateHash(hAlg, &hHash, nullptr, 0, nullptr, 0, 0) < 0) { BCryptCloseAlgorithmProvider(hAlg, 0); return false; }
+    if (BCryptHashData(hHash, (PUCHAR)in.data(), (ULONG)in.size(), 0) < 0) { BCryptDestroyHash(hHash); BCryptCloseAlgorithmProvider(hAlg, 0); return false; }
+    if (BCryptFinishHash(hHash, (PUCHAR)out32.data(), cbHash, 0) < 0) { BCryptDestroyHash(hHash); BCryptCloseAlgorithmProvider(hAlg, 0); return false; }
+    BCryptDestroyHash(hHash); BCryptCloseAlgorithmProvider(hAlg, 0); return true;
+}
+
+static std::string RandomBase64Url(size_t bytes = 32) {
+    std::vector<uint8_t> buf(bytes);
+    BCryptGenRandom(nullptr, buf.data(), (ULONG)buf.size(), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    std::string out; Base64UrlEncode(buf, out); return out;
+}
+
+static std::string CodeChallengeFromVerifier(const std::string& verifier) {
+    std::vector<uint8_t> hash; if (!Sha256(verifier, hash)) return std::string();
+    std::string out; Base64UrlEncode(hash, out); return out;
+}
+
+static std::wstring Utf8ToWide(const std::string& s) {
+    if (s.empty()) return L"";
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+    std::wstring w; w.resize(n);
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
+    return w;
+}
+
+static std::string WideToUtf8(const std::wstring& w) {
+    if (w.empty()) return std::string();
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+    std::string s; s.resize(n);
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), &s[0], n, nullptr, nullptr);
+    return s;
+}
+
+static std::wstring GetEnvW(const wchar_t* name) {
+    DWORD needed = GetEnvironmentVariableW(name, nullptr, 0);
+    if (needed == 0) return L"";
+    std::wstring buf; buf.resize(needed);
+    DWORD got = GetEnvironmentVariableW(name, &buf[0], needed);
+    if (got == 0) return L"";
+    if (!buf.empty() && buf.back() == L'\0') buf.pop_back();
+    return buf;
+}
+
+static std::wstring GetAppDataPath() {
+    PWSTR path = nullptr; std::wstring out;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &path))) {
+        out = path; CoTaskMemFree(path);
+    }
+    return out;
+}
+
+static void SaveRefreshTokenSecure(const std::wstring& token) {
+    std::wstring dir = GetAppDataPath() + L"\\YT247Desktop";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    std::wstring file = dir + L"\\refresh.bin";
+    DATA_BLOB in{}; in.pbData = (BYTE*)token.c_str(); in.cbData = (DWORD)((token.size()+1) * sizeof(wchar_t));
+    DATA_BLOB out{};
+    if (CryptProtectData(&in, L"YT247Desktop", nullptr, nullptr, nullptr, 0, &out)) {
+        HANDLE h = CreateFileW(file.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_HIDDEN, nullptr);
+        if (h != INVALID_HANDLE_VALUE) {
+            DWORD written=0; WriteFile(h, out.pbData, out.cbData, &written, nullptr); CloseHandle(h);
+        }
+        LocalFree(out.pbData);
+    }
+}
+
+static bool RemoveRefreshTokenSecure() {
+    std::wstring dir = GetAppDataPath() + L"\\YT247Desktop";
+    std::wstring file = dir + L"\\refresh.bin";
+    return DeleteFileW(file.c_str()) != 0;
+}
+
+static bool LoadRefreshTokenSecure(std::wstring& outToken) {
+    outToken.clear();
+    std::wstring dir = GetAppDataPath() + L"\\YT247Desktop";
+    std::wstring file = dir + L"\\refresh.bin";
+    HANDLE h = CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD size = GetFileSize(h, nullptr);
+    if (size == INVALID_FILE_SIZE || size == 0) { CloseHandle(h); return false; }
+    std::vector<BYTE> enc(size);
+    DWORD read=0; if (!ReadFile(h, enc.data(), size, &read, nullptr) || read != size) { CloseHandle(h); return false; }
+    CloseHandle(h);
+    DATA_BLOB in{}; in.pbData = enc.data(); in.cbData = read;
+    DATA_BLOB out{}; LPWSTR desc=nullptr;
+    if (!CryptUnprotectData(&in, &desc, nullptr, nullptr, nullptr, 0, &out)) return false;
+    if (desc) LocalFree(desc);
+    std::wstring token((wchar_t*)out.pbData, out.cbData / sizeof(wchar_t));
+    if (!token.empty() && token.back() == L'\0') token.pop_back();
+    outToken = token;
+    LocalFree(out.pbData);
+    return !outToken.empty();
+}
+
+static std::string HttpPostForm(const wchar_t* host, INTERNET_PORT port, const wchar_t* path, const std::string& body) {
+    std::string resp;
+    HINTERNET h = WinHttpOpen(L"YT247Desktop/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!h) return resp;
+    HINTERNET c = WinHttpConnect(h, host, port, 0);
+    if (!c) { WinHttpCloseHandle(h); return resp; }
+    HINTERNET r = WinHttpOpenRequest(c, L"POST", path, nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    if (!r) { WinHttpCloseHandle(c); WinHttpCloseHandle(h); return resp; }
+    std::wstring headers = L"Content-Type: application/x-www-form-urlencoded\r\n";
+    BOOL ok = WinHttpSendRequest(r, headers.c_str(), (DWORD)-1, (LPVOID)body.data(), (DWORD)body.size(), (DWORD)body.size(), 0);
+    if (ok) ok = WinHttpReceiveResponse(r, nullptr);
+    if (ok) {
+        for(;;) {
+            DWORD avail=0; if (!WinHttpQueryDataAvailable(r, &avail) || avail==0) break;
+            std::string chunk; chunk.resize(avail);
+            DWORD read=0; if (!WinHttpReadData(r, &chunk[0], avail, &read) || read==0) break;
+            chunk.resize(read); resp += chunk;
+        }
+    }
+    WinHttpCloseHandle(r); WinHttpCloseHandle(c); WinHttpCloseHandle(h);
+    return resp;
+}
+
+static std::string HttpPostJson(const wchar_t* host, INTERNET_PORT port, const std::wstring& pathWithQuery, const std::string& json) {
+    std::string resp;
+    HINTERNET h = WinHttpOpen(L"YT247Desktop/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!h) return resp;
+    HINTERNET c = WinHttpConnect(h, host, port, 0);
+    if (!c) { WinHttpCloseHandle(h); return resp; }
+    HINTERNET r = WinHttpOpenRequest(c, L"POST", pathWithQuery.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    if (!r) { WinHttpCloseHandle(c); WinHttpCloseHandle(h); return resp; }
+    std::wstring headers = L"Content-Type: application/json\r\n";
+    BOOL ok = WinHttpSendRequest(r, headers.c_str(), (DWORD)-1, (LPVOID)json.data(), (DWORD)json.size(), (DWORD)json.size(), 0);
+    if (ok) ok = WinHttpReceiveResponse(r, nullptr);
+    if (ok) {
+        for(;;) {
+            DWORD avail=0; if (!WinHttpQueryDataAvailable(r, &avail) || avail==0) break;
+            std::string chunk; chunk.resize(avail);
+            DWORD read=0; if (!WinHttpReadData(r, &chunk[0], avail, &read) || read==0) break;
+            chunk.resize(read); resp += chunk;
+        }
+    }
+    WinHttpCloseHandle(r); WinHttpCloseHandle(c); WinHttpCloseHandle(h);
+    return resp;
+}
+
+static std::string ExtractJsonString(const std::string& json, const std::string& key) {
+    std::string pat = "\"" + key + "\"";
+    size_t k = json.find(pat); if (k==std::string::npos) return std::string();
+    size_t c = json.find(':', k); if (c==std::string::npos) return std::string();
+    size_t q1 = json.find('"', c); if (q1==std::string::npos) return std::string();
+    size_t q2 = json.find('"', q1+1); if (q2==std::string::npos) return std::string();
+    return json.substr(q1+1, q2-q1-1);
+}
+
+static unsigned int ToSecondsOr(const std::string& s, unsigned int fallback) {
+    if (s.empty()) return fallback;
+    unsigned long v = 0; for (char c : s) { if (c<'0'||c>'9') return fallback; v = v*10 + (c - '0'); if (v > 0xFFFFFFFFUL) return fallback; }
+    return (unsigned int)v;
+}
+
+static void ScheduleAuthRefresh(HWND hwnd, unsigned int expiresSec) {
+    unsigned int ms = ((expiresSec > 120 ? (expiresSec - 60) : 600)) * 1000U;
+    SetTimer(hwnd, ID_TIMER_AUTH, ms, nullptr);
+}
+
+static std::string FirebaseLookupEmail(const std::wstring& idTokenW) {
+    std::wstring path = L"/v1/accounts:lookup?key=" + gFirebaseApiKey;
+    std::ostringstream j; j << "{\"idToken\":\"" << UrlEncode(WideToUtf8(idTokenW)) << "\"}";
+    std::string resp = HttpPostJson(L"identitytoolkit.googleapis.com", INTERNET_DEFAULT_HTTPS_PORT, path, j.str());
+    return ExtractJsonString(resp, "email");
+}
+
+static DWORD WINAPI FirebaseRefreshThread(LPVOID param) {
+    HWND hwnd = (HWND)param;
+    std::wstring tokenW = g_refreshToken;
+    if (tokenW.empty()) {
+        std::wstring saved;
+        if (!LoadRefreshTokenSecure(saved)) return 0;
+        tokenW = saved;
+    }
+    AppendLog(L"Menyegarkan sesi dari refresh token...\r\n");
+    std::string body = std::string("grant_type=refresh_token&refresh_token=") + UrlEncode(WideToUtf8(tokenW));
+    std::wstring path = L"/v1/token?key=" + gFirebaseApiKey;
+    std::string resp = HttpPostForm(L"securetoken.googleapis.com", INTERNET_DEFAULT_HTTPS_PORT, path.c_str(), body);
+    std::string idToken = ExtractJsonString(resp, "id_token");
+    std::string refresh = ExtractJsonString(resp, "refresh_token");
+    unsigned int expSec = ToSecondsOr(ExtractJsonString(resp, "expires_in"), 3600);
+    if (idToken.empty() || refresh.empty()) { AppendLog(L"Gagal refresh sesi.\r\n"); return 0; }
+    g_idToken = Utf8ToWide(idToken);
+    g_refreshToken = Utf8ToWide(refresh);
+    g_isSignedIn = true;
+    SaveRefreshTokenSecure(g_refreshToken);
+
+    // Lookup email if not known
+    if (g_signedInEmail.empty()) {
+        std::string em = FirebaseLookupEmail(g_idToken);
+        g_signedInEmail = Utf8ToWide(em);
+    }
+    if (g_hLblEmail) SetWindowTextW(g_hLblEmail, g_signedInEmail.c_str());
+    if (g_hBtnGoogle) ShowWindow(g_hBtnGoogle, SW_HIDE);
+    if (g_hBtnSignOut) { ShowWindow(g_hBtnSignOut, SW_SHOW); EnableWindow(g_hBtnSignOut, TRUE); }
+    if (g_hBtnStart && !g_isStreaming) EnableWindow(g_hBtnStart, TRUE);
+
+    // Update title
+    if (g_hMainWnd) {
+        if (g_baseTitle.empty()) {
+            int len = GetWindowTextLengthW(g_hMainWnd);
+            if (len > 0) { std::vector<wchar_t> buf(len+1); GetWindowTextW(g_hMainWnd, buf.data(), len+1); g_baseTitle.assign(buf.data()); }
+        }
+        if (!g_signedInEmail.empty()) {
+            std::wstring cur = g_baseTitle.empty() ? L"YT247Desktop" : g_baseTitle;
+            std::wstring newTitle = cur + L" + " + g_signedInEmail;
+            SetWindowTextW(g_hMainWnd, newTitle.c_str());
+        }
+    }
+
+    SetWindowTextW(g_hLblStatus, L"Signed in (restored).");
+    AppendLog(L"Sesi dipulihkan.\r\n");
+    if (hwnd) ScheduleAuthRefresh(hwnd, expSec);
+    return 0;
+}
+
+static void DoSignOut(HWND hwnd) {
+    g_isSignedIn = false; g_idToken.clear(); g_refreshToken.clear(); g_signedInEmail.clear();
+    KillTimer(hwnd, ID_TIMER_AUTH);
+    RemoveRefreshTokenSecure();
+    if (g_hLblStatus) SetWindowTextW(g_hLblStatus, L"Signed out.");
+    if (g_hLblEmail) SetWindowTextW(g_hLblEmail, L"");
+    if (g_hBtnStart) EnableWindow(g_hBtnStart, FALSE);
+    if (g_hBtnSignOut) ShowWindow(g_hBtnSignOut, SW_HIDE);
+    if (g_hBtnGoogle) ShowWindow(g_hBtnGoogle, SW_SHOW);
+    if (g_hMainWnd) {
+        if (!g_baseTitle.empty()) SetWindowTextW(g_hMainWnd, g_baseTitle.c_str());
+    }
+}
+
+struct OAuthResult { std::string code; std::string state; };
+
+static SOCKET CreateLoopbackListener(unsigned short& outPort) {
+    SOCKET s = INVALID_SOCKET;
+    WSADATA wsa; if (WSAStartup(MAKEWORD(2,2), &wsa) != 0) return INVALID_SOCKET;
+    s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) return INVALID_SOCKET;
+    sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); addr.sin_port = 0;
+    if (bind(s, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) { closesocket(s); WSACleanup(); return INVALID_SOCKET; }
+    if (listen(s, 1) == SOCKET_ERROR) { closesocket(s); WSACleanup(); return INVALID_SOCKET; }
+    int len=sizeof(addr); if (getsockname(s, (sockaddr*)&addr, &len)==0) { outPort = ntohs(addr.sin_port); }
+    return s;
+}
+
+static OAuthResult WaitForOAuthCallback(SOCKET listener) {
+    OAuthResult res; res.code.clear(); res.state.clear();
+    sockaddr_in cli{}; int clen=sizeof(cli);
+    SOCKET c = accept(listener, (sockaddr*)&cli, &clen);
+    if (c == INVALID_SOCKET) return res;
+    char buf[4096]; int r = recv(c, buf, sizeof(buf)-1, 0); if (r<0) { closesocket(c); return res; }
+    buf[r] = 0;
+    std::string req(buf);
+    // Parse request line
+    size_t sp1 = req.find(' '); if (sp1!=std::string::npos) {
+        size_t sp2 = req.find(' ', sp1+1);
+        if (sp2!=std::string::npos) {
+            std::string path = req.substr(sp1+1, sp2-sp1-1);
+            // Expect /callback?code=...&state=...
+            size_t q = path.find('?');
+            std::string qp = (q==std::string::npos) ? std::string() : path.substr(q+1);
+            auto getq = [&](const char* key){
+                std::string k = std::string(key) + "=";
+                size_t p = qp.find(k);
+                if (p==std::string::npos) return std::string();
+                size_t e = qp.find('&', p);
+                std::string v = qp.substr(p + k.size(), (e==std::string::npos)?std::string::npos:(e-p-k.size()));
+                return v;
+            };
+            res.code = UrlDecode(getq("code"));
+            res.state = UrlDecode(getq("state"));
+        }
+    }
+    const char* resp = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=UTF-8\r\nConnection: close\r\n\r\n<!doctype html><html><body><p>Authentication received. You can close this window.</p></body></html>";
+    send(c, resp, (int)strlen(resp), 0);
+    closesocket(c);
+    return res;
+}
+
+static DWORD WINAPI GoogleSignInThread(LPVOID param) {
+    HWND hwnd = (HWND)param;
+    AppendLog(L"Memulai Google Sign-In...\r\n");
+    unsigned short port=0; SOCKET listener = CreateLoopbackListener(port);
+    if (listener == INVALID_SOCKET || port==0) { AppendLog(L"Gagal membuat listener lokal.\r\n"); return 0; }
+
+    std::string state = RandomBase64Url(16);
+    std::string verifier = RandomBase64Url(32);
+    std::string challenge = CodeChallengeFromVerifier(verifier);
+
+    std::ostringstream authUrl;
+    authUrl << "https://accounts.google.com/o/oauth2/v2/auth?"
+            << "client_id=" << UrlEncode(WideToUtf8(gGoogleClientId))
+            << "&redirect_uri=" << UrlEncode("http://127.0.0.1:" + std::to_string(port) + "/callback")
+            << "&response_type=code"
+            << "&scope=" << UrlEncode("openid email profile")
+            << "&code_challenge=" << UrlEncode(challenge)
+            << "&code_challenge_method=S256"
+            << "&access_type=offline&prompt=consent"
+            << "&state=" << UrlEncode(state);
+
+    std::wstring wurl = Utf8ToWide(authUrl.str());
+    ShellExecuteW(nullptr, L"open", wurl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+
+    OAuthResult cb = WaitForOAuthCallback(listener);
+    closesocket(listener); WSACleanup();
+    if (cb.code.empty() || cb.state != state) { AppendLog(L"Login dibatalkan atau state tidak cocok.\r\n"); return 0; }
+
+    // Exchange code for tokens
+    std::ostringstream body;
+    body << "grant_type=authorization_code"
+         << "&code=" << UrlEncode(cb.code)
+         << "&client_id=" << UrlEncode(WideToUtf8(gGoogleClientId))
+         << "&redirect_uri=" << UrlEncode("http://127.0.0.1:" + std::to_string(port) + "/callback")
+         << "&code_verifier=" << UrlEncode(verifier);
+    // Include client_secret if provided (for clients that require it)
+    if (!gGoogleClientSecret.empty()) {
+        body << "&client_secret=" << UrlEncode(WideToUtf8(gGoogleClientSecret));
+    }
+
+    std::string tokResp = HttpPostForm(L"oauth2.googleapis.com", INTERNET_DEFAULT_HTTPS_PORT, L"/token", body.str());
+    std::string id_token = ExtractJsonString(tokResp, "id_token");
+    if (id_token.empty()) {
+        std::string err = ExtractJsonString(tokResp, "error");
+        std::string desc = ExtractJsonString(tokResp, "error_description");
+        std::wstring w = L"Gagal tukar code ke id_token.";
+        if (!err.empty()) { w += L" ("; w += Utf8ToWide(err); if (!desc.empty()) { w += L": "; w += Utf8ToWide(desc); } w += L")"; }
+        w += L"\r\n";
+        AppendLog(w);
+        return 0;
+    }
+
+    // Sign in to Firebase
+    std::string postBody = "id_token=" + UrlEncode(id_token) + "&providerId=google.com";
+    std::ostringstream json;
+    json << "{\"postBody\":\"" << postBody << "\",\"requestUri\":\"http://localhost\",\"returnSecureToken\":true,\"returnIdpCredential\":true}";
+    std::wstring path = L"/v1/accounts:signInWithIdp?key=" + gFirebaseApiKey;
+    std::string fbResp = HttpPostJson(L"identitytoolkit.googleapis.com", INTERNET_DEFAULT_HTTPS_PORT, path, json.str());
+    std::string idTokenFb = ExtractJsonString(fbResp, "idToken");
+    std::string refreshFb = ExtractJsonString(fbResp, "refreshToken");
+    std::string emailFb = ExtractJsonString(fbResp, "email");
+    unsigned int expSec = ToSecondsOr(ExtractJsonString(fbResp, "expiresIn"), 3600);
+    if (idTokenFb.empty() || refreshFb.empty()) { AppendLog(L"Gagal login ke Firebase.\r\n"); return 0; }
+
+    g_idToken = Utf8ToWide(idTokenFb);
+    g_refreshToken = Utf8ToWide(refreshFb);
+    g_isSignedIn = true;
+    SaveRefreshTokenSecure(g_refreshToken);
+
+    std::wstring status = L"Signed in";
+    std::wstring emailW = Utf8ToWide(emailFb);
+    if (!emailFb.empty()) { status += L" as "; status += emailW; }
+    status += L".";
+    SetWindowTextW(g_hLblStatus, status.c_str());
+    AppendLog(L"Sukses Sign-In dengan Google.\r\n");
+
+    // Update main window title to include email
+    if (!emailW.empty() && g_hMainWnd) {
+        int len = GetWindowTextLengthW(g_hMainWnd);
+        std::wstring cur;
+        if (len > 0) {
+            std::vector<wchar_t> buf(len + 1);
+            GetWindowTextW(g_hMainWnd, buf.data(), len + 1);
+            cur.assign(buf.data());
+        }
+        if (g_baseTitle.empty()) g_baseTitle = cur;
+        if (cur.empty()) cur = g_baseTitle.empty() ? L"YT247Desktop" : g_baseTitle;
+        std::wstring newTitle = cur + L" + " + emailW;
+        SetWindowTextW(g_hMainWnd, newTitle.c_str());
+    }
+    g_signedInEmail = emailW;
+    if (g_hLblEmail) SetWindowTextW(g_hLblEmail, emailW.c_str());
+    if (g_hBtnGoogle) ShowWindow(g_hBtnGoogle, SW_HIDE);
+    if (g_hBtnSignOut) { ShowWindow(g_hBtnSignOut, SW_SHOW); EnableWindow(g_hBtnSignOut, TRUE); }
+    if (g_hBtnStart && !g_isStreaming) EnableWindow(g_hBtnStart, TRUE);
+    if (hwnd) ScheduleAuthRefresh(hwnd, expSec);
+    return 0;
 }
 
 // Utility: check known video extensions
@@ -206,6 +689,7 @@ static void ClearVideoInfoFields() {
     if (g_hInfoVDur)  SetWindowTextW(g_hInfoVDur,  L"");
     if (g_hInfoVBr)   SetWindowTextW(g_hInfoVBr,   L"");
     if (g_hInfoVRes)  SetWindowTextW(g_hInfoVRes,  L"");
+    if (g_hInfoVOr)   SetWindowTextW(g_hInfoVOr,   L"");
 }
 
 static void RefreshVideoInfo(const std::wstring& path) {
@@ -261,14 +745,19 @@ static void RefreshVideoInfo(const std::wstring& path) {
         if (w > 0 && h > 0) {
             wchar_t buf[64]; swprintf(buf, 64, L"%dx%d", w, h);
             SetWindowTextW(g_hInfoVRes, buf);
+            // Orientation
+            const wchar_t* orient = (h > w) ? L"Vertical" : (w > h) ? L"Horizontal" : L"Square";
+            SetWindowTextW(g_hInfoVOr, orient);
         } else {
             SetWindowTextW(g_hInfoVRes, L"");
+            SetWindowTextW(g_hInfoVOr, L"");
         }
         store->Release();
     } else {
         SetWindowTextW(g_hInfoVDur, L"");
         SetWindowTextW(g_hInfoVBr, L"");
         SetWindowTextW(g_hInfoVRes, L"");
+        SetWindowTextW(g_hInfoVOr, L"");
     }
 }
 
@@ -537,14 +1026,25 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             M, M+4, LBLW, H, hwnd, nullptr, nullptr, nullptr);
 
         g_hEditVideo = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-            INPUTS_X, M, WND_W - INPUTS_X - (BTN_W + 8) - M, H, hwnd, (HMENU)ID_EDIT_VIDEO, nullptr, nullptr);
+            INPUTS_X, M, WND_W - INPUTS_X - (2*BTN_W + 8) - M, H, hwnd, (HMENU)ID_EDIT_VIDEO, nullptr, nullptr);
 
         g_hBtnBrowse = CreateWindowW(L"BUTTON", L"Browse...", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-            WND_W - (BTN_W + M), M, BTN_W, H, hwnd, (HMENU)ID_BTN_BROWSE, nullptr, nullptr);
+            WND_W - (2*BTN_W + 8 + M), M, BTN_W, H, hwnd, (HMENU)ID_BTN_BROWSE, nullptr, nullptr);
+
+        // Sign In with Google button (top-right corner)
+        g_hBtnGoogle = CreateWindowW(L"BUTTON", L"Sign In", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            WND_W - (BTN_W + M), M, BTN_W, H, hwnd, (HMENU)ID_BTN_GOOGLE, nullptr, nullptr);
+        // Sign Out button (same position, initially hidden)
+        g_hBtnSignOut = CreateWindowW(L"BUTTON", L"Sign Out", WS_CHILD | WS_TABSTOP,
+            WND_W - (BTN_W + M), M, BTN_W, H, hwnd, (HMENU)ID_BTN_SIGNOUT, nullptr, nullptr);
 
         const int validY = M + H + 8;
         g_hLblValid = CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE,
             INPUTS_X, validY, 200, H, hwnd, (HMENU)ID_LBL_VALID, nullptr, nullptr);
+        // Email label on the right side of the same row
+        const int EMAIL_W = 220;
+        g_hLblEmail = CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_RIGHT,
+            WND_W - (BTN_W + M) - 8 - EMAIL_W, validY, EMAIL_W, H, hwnd, (HMENU)ID_LBL_EMAIL, nullptr, nullptr);
 
         // Video Information section below the Valid label
         const int INFO_LW = LBLW; // align info labels width with main labels
@@ -576,9 +1076,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             M, infoRowY0 + 3*H, INFO_LW, H, hwnd, (HMENU)ID_INFO_L_RES, nullptr, nullptr);
         g_hInfoVRes = CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE,
             infoValX, infoRowY0 + 3*H, infoValW, H, hwnd, (HMENU)ID_INFO_V_RES, nullptr, nullptr);
+        // Orientation
+        g_hInfoLOr = CreateWindowW(L"STATIC", L"Orientasi", WS_CHILD | WS_VISIBLE,
+            M, infoRowY0 + 4*H, INFO_LW, H, hwnd, (HMENU)ID_INFO_L_ORI, nullptr, nullptr);
+        g_hInfoVOr = CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+            infoValX, infoRowY0 + 4*H, infoValW, H, hwnd, (HMENU)ID_INFO_V_ORI, nullptr, nullptr);
 
         // Row B: Stream Key (below video info section)
-        const int row2Y = infoRowY0 + 4*H + 8; // after 4 rows of info
+        const int row2Y = infoRowY0 + 5*H + 8; // after 5 rows of info
         CreateWindowW(L"STATIC", L"Stream Key", WS_CHILD | WS_VISIBLE,
             M, row2Y+4, LBLW, H, hwnd, nullptr, nullptr, nullptr);
 
@@ -588,6 +1093,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         // Place Start to the left of Stop (Stop is on the right)
         g_hBtnStart = CreateWindowW(L"BUTTON", L"Start Stream", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
             WND_W - (2*BTN_W + 8 + M), row2Y, BTN_W, H, hwnd, (HMENU)ID_BTN_START, nullptr, nullptr);
+        EnableWindow(g_hBtnStart, FALSE);
 
         g_hBtnStop = CreateWindowW(L"BUTTON", L"Stop Stream", WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_DISABLED,
             WND_W - (BTN_W + M), row2Y, BTN_W, H, hwnd, (HMENU)ID_BTN_STOP, nullptr, nullptr);
@@ -624,8 +1130,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         HWND ctrls[] = { g_hEditVideo, g_hBtnBrowse, g_hLblValid, g_hInfoHeader,
                          g_hInfoLSize, g_hInfoVSize, g_hInfoLDur, g_hInfoVDur,
                          g_hInfoLBr, g_hInfoVBr, g_hInfoLRes, g_hInfoVRes,
+                         g_hInfoLOr, g_hInfoVOr,
                          g_hEditKey, g_hBtnStart, g_hBtnStop, g_hLblArgHdr, g_hEditArgs, g_hBtnCopyArgs,
-                         g_hLblStatus, g_hEditLog, g_hBtnClearLog };
+                         g_hLblStatus, g_hEditLog, g_hBtnClearLog, g_hBtnGoogle, g_hBtnSignOut, g_hLblEmail };
         for (HWND c : ctrls) if (c) SendMessageW(c, WM_SETFONT, (WPARAM)g_hFont, TRUE);
 
         if (!VerifyFfmpegOrDie(hwnd)) {
@@ -638,6 +1145,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         RecalcScrollBar(hwnd);
 
         g_hMainWnd = hwnd;
+        // Capture base title
+        {
+            int len = GetWindowTextLengthW(hwnd);
+            if (len > 0) { std::vector<wchar_t> t(len+1); GetWindowTextW(hwnd, t.data(), len+1); g_baseTitle.assign(t.data()); }
+        }
+        // Try restore session via refresh token in background
+        {
+            HANDLE h = CreateThread(nullptr, 0, FirebaseRefreshThread, hwnd, 0, nullptr);
+            if (h) CloseHandle(h);
+        }
         return 0;
     }
     case WM_COMMAND: {
@@ -666,6 +1183,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             }
         } else if (id == ID_BTN_CLEARLOG && code == BN_CLICKED) {
             if (g_hEditLog) SetWindowTextW(g_hEditLog, L"");
+        } else if (id == ID_BTN_GOOGLE && code == BN_CLICKED) {
+            if (!g_isSignedIn) {
+                EnableWindow((HWND)lParam, FALSE);
+                HANDLE h = CreateThread(nullptr, 0, GoogleSignInThread, hwnd, 0, nullptr);
+                if (h) CloseHandle(h);
+                EnableWindow((HWND)lParam, TRUE);
+            }
+        } else if (id == ID_BTN_SIGNOUT && code == BN_CLICKED) {
+            DoSignOut(hwnd);
         } else if (id == ID_BTN_COPYARGS && code == BN_CLICKED) {
             // Copy current args preview to clipboard
             if (OpenClipboard(hwnd)) {
@@ -757,6 +1283,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 if (g_hEditLog) SetWindowTextW(g_hEditLog, L"");
             }
         }
+        else if (wParam == ID_TIMER_AUTH) {
+            // Trigger background refresh; the thread will reschedule
+            HANDLE h = CreateThread(nullptr, 0, FirebaseRefreshThread, hwnd, 0, nullptr);
+            if (h) CloseHandle(h);
+            KillTimer(hwnd, ID_TIMER_AUTH);
+        }
         return 0;
     }
     case WM_APP_APPEND_LOG: {
@@ -783,6 +1315,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
     }
     case WM_CLOSE:
+        KillTimer(hwnd, ID_TIMER_AUTH);
         if (g_isStreaming) StopFfmpeg(hwnd);
         DestroyWindow(hwnd);
         return 0;
@@ -794,6 +1327,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 }
 
 int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
+    // Load secrets from environment variables
+    gFirebaseApiKey = GetEnvW(L"YT247_FIREBASE_API_KEY");
+    gGoogleClientId = GetEnvW(L"YT247_GOOGLE_CLIENT_ID");
+    gGoogleClientSecret = GetEnvW(L"YT247_GOOGLE_CLIENT_SECRET");
     // In case the binary was linked as a console app on some toolchains,
     // make sure any attached console stays hidden.
     if (HWND hc = GetConsoleWindow()) {

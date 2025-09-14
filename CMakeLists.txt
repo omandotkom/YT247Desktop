@@ -9,7 +9,7 @@ add_executable(YT247Desktop WIN32 src/main.cpp)
 
 if(WIN32)
     set_target_properties(YT247Desktop PROPERTIES WIN32_EXECUTABLE ON)
-    target_link_libraries(YT247Desktop PRIVATE user32 gdi32 comdlg32 shell32)
+    target_link_libraries(YT247Desktop PRIVATE user32 gdi32 comdlg32 shell32 winhttp crypt32 ws2_32 bcrypt)
     # When building with MinGW, prefer static libstdc++/libgcc to avoid
     # requiring libstdc++-6.dll/libgcc_s_seh-1.dll on end-user machines.
     if(MINGW)

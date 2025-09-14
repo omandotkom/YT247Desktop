@@ -68,7 +68,7 @@ build YT247Desktop.exe: CXX_EXECUTABLE_LINKER__YT247Desktop_Release CMakeFiles/Y
   CONFIG = Release
   FLAGS = -O3 -DNDEBUG
   LINK_FLAGS = -mwindows -static-libstdc++ -static-libgcc -Wl,-s -mwindows -municode
-  LINK_LIBRARIES = -luser32  -lgdi32  -lcomdlg32  -lshell32  -lkernel32 -luser32 -lgdi32 -lwinspool -lshell32 -lole32 -loleaut32 -luuid -lcomdlg32 -ladvapi32
+  LINK_LIBRARIES = -luser32  -lgdi32  -lcomdlg32  -lshell32  -lwinhttp  -lcrypt32  -lws2_32  -lbcrypt  -lkernel32 -luser32 -lgdi32 -lwinspool -lshell32 -lole32 -loleaut32 -luuid -lcomdlg32 -ladvapi32
   OBJECT_DIR = CMakeFiles\YT247Desktop.dir
   POST_BUILD = cd .
   PRE_LINK = cd .
