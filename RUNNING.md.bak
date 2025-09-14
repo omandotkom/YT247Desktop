@@ -1,0 +1,22 @@
+YT247Desktop — Running and Building on Windows
+
+Run the prebuilt app
+- Put `ffmpeg.exe` in the same folder as `YT247Desktop.exe`.
+- If Windows reports “libstdc++-6.dll was not found”, copy these 3 DLLs next to the EXE:
+  - `libstdc++-6.dll`
+  - `libgcc_s_seh-1.dll`
+  - `libwinpthread-1.dll`
+  These are commonly available in `C:\Program Files\Git\mingw64\bin` if you have Git for Windows installed.
+
+Building from source (CMake)
+- MSVC (recommended)
+  - `cmake -S . -B build -G "Visual Studio 17 2022" -A x64`
+  - `cmake --build build --config Release`
+- MinGW (static runtimes enabled)
+  - `cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release`
+  - `cmake --build build --config Release`
+
+Notes
+- The app expects `ffmpeg.exe` to live next to the EXE.
+- The CMake config now links static `libstdc++`/`libgcc` on MinGW to avoid extra DLLs.
+

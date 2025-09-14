@@ -1,0 +1,3 @@
+O:/VSCODE_WORKSPACE/YT247Desktop/build-mingw-ninja/CMakeFiles/YT247Desktop.dir
+O:/VSCODE_WORKSPACE/YT247Desktop/build-mingw-ninja/CMakeFiles/edit_cache.dir
+O:/VSCODE_WORKSPACE/YT247Desktop/build-mingw-ninja/CMakeFiles/rebuild_cache.dir
